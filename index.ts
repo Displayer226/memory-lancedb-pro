@@ -190,8 +190,10 @@ interface PluginConfig {
     beforeResetNote?: boolean;
     skipSubagentBootstrap?: boolean;
     ensureLearningFiles?: boolean;
-  };
-  memoryReflection?: {
+    reflectionAgentId?: string;
+    reflectionModel?: string;
+    reflectionPrompt?: string;
+  };  memoryReflection?: {
     enabled?: boolean;
     storeToLanceDB?: boolean;
     writeLegacyCombined?: boolean;
@@ -376,6 +378,7 @@ After completing tasks, evaluate if any learnings should be captured:
 Keep entries simple: date, title, what happened, what to do differently.`;
 
 const SELF_IMPROVEMENT_NOTE_PREFIX = "/note self-improvement (before reset):";
+const DEFAULT_SELF_IMPROVEMENT_REFLECTION_PROMPT = "Analyze the provided session history. Identify learnings, errors, and best practices. Update .learnings/LEARNINGS.md and .learnings/ERRORS.md. Distill reusable rules into AGENTS.md, SOUL.md, or TOOLS.md. Work silently in the background.";
 const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
 const DEFAULT_REFLECTION_MAX_INPUT_CHARS = 24_000;
 const DEFAULT_REFLECTION_TIMEOUT_MS = 20_000;
@@ -541,6 +544,9 @@ async function runReflectionViaCli(params: {
   workspaceDir: string;
   timeoutMs: number;
   thinkLevel: ReflectionThinkLevel;
+  model?: string;
+  isBackground?: boolean;
+  parentSessionId?: string;
 }): Promise<string> {
   const cliBin = process.env.OPENCLAW_CLI_BIN?.trim() || "openclaw";
   const outerTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
@@ -563,12 +569,27 @@ async function runReflectionViaCli(params: {
     sessionId,
   ];
 
+  const env = { ...process.env, NO_COLOR: "1" };
+  if (params.model) {
+    env.OPENCLAW_MODEL = params.model;
+  }
+  if (params.parentSessionId) {
+    env.OPENCLAW_PARENT_SESSION_ID = params.parentSessionId;
+  }
+
   return await new Promise<string>((resolve, reject) => {
     const child = spawn(cliBin, args, {
       cwd: params.workspaceDir,
-      env: { ...process.env, NO_COLOR: "1" },
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+
+    if (params.isBackground) {
+      // Fire and forget for background runs
+      child.unref();
+      resolve("");
+      return;
+    }
 
     let stdout = "";
     let stderr = "";
@@ -1120,6 +1141,7 @@ function buildReflectionFallbackText(): string {
 }
 
 async function generateReflectionText(params: {
+  api: OpenClawPluginApi;
   conversation: string;
   maxInputChars: number;
   cfg: unknown;
@@ -1155,7 +1177,7 @@ async function generateReflectionText(params: {
       retryState,
       onLog: onRetryLog,
       execute: async () => {
-        const runEmbeddedPiAgent = await loadEmbeddedPiRunner();
+        const runEmbeddedPiAgent = params.api.runtime.agent.runEmbeddedPiAgent;
         const modelRef = resolveAgentPrimaryModelRef(params.cfg, params.agentId);
         const { provider, model } = modelRef ? splitProviderModel(modelRef) : {};
         const embeddedTimeoutMs = Math.max(params.timeoutMs + 5000, 15000);
@@ -2088,19 +2110,19 @@ const memoryLanceDBProPlugin = {
         description:
           "Consolidate semantically similar old memories into refined single entries " +
           "(progressive summarization). Reduces noise and improves retrieval quality over time. " +
-          "Use dry_run:true first to preview the compaction plan without making changes.",
+          "Use dryRun:true (default) first to preview the compaction plan without making changes.",
         inputSchema: {
           type: "object" as const,
           properties: {
-            dry_run: {
+            dryRun: {
               type: "boolean",
-              description: "Preview clusters without writing changes. Default: false.",
+              description: "Preview clusters without writing changes. Default: true.",
             },
-            min_age_days: {
+            minAgeDays: {
               type: "number",
               description: "Only compact memories at least this many days old. Default: 7.",
             },
-            similarity_threshold: {
+            similarityThreshold: {
               type: "number",
               description: "Cosine similarity threshold for clustering [0-1]. Default: 0.88.",
             },
@@ -2116,16 +2138,16 @@ const memoryLanceDBProPlugin = {
           const compactionCfg: CompactionConfig = {
             enabled: true,
             minAgeDays:
-              typeof args.min_age_days === "number"
-                ? args.min_age_days
+              typeof args.minAgeDays === "number"
+                ? args.minAgeDays
                 : (config.memoryCompaction?.minAgeDays ?? 7),
             similarityThreshold:
-              typeof args.similarity_threshold === "number"
-                ? Math.max(0, Math.min(1, args.similarity_threshold))
+              typeof args.similarityThreshold === "number"
+                ? Math.max(0, Math.min(1, args.similarityThreshold))
                 : (config.memoryCompaction?.similarityThreshold ?? 0.88),
             minClusterSize: config.memoryCompaction?.minClusterSize ?? 2,
             maxMemoriesToScan: config.memoryCompaction?.maxMemoriesToScan ?? 200,
-            dryRun: args.dry_run === true,
+            dryRun: args.dryRun !== false,
             cooldownHours: config.memoryCompaction?.cooldownHours ?? 24,
           };
           const scopes =
@@ -3006,14 +3028,51 @@ const memoryLanceDBProPlugin = {
               return;
             }
 
+            if (config.selfImprovement?.reflectionAgentId && (action === "reset" || action === "new")) {
+              const reflectionPrompt = config.selfImprovement.reflectionPrompt || DEFAULT_SELF_IMPROVEMENT_REFLECTION_PROMPT;
+              const reflectionModel = config.selfImprovement.reflectionModel;
+              
+              let reflectionAgentId = config.selfImprovement.reflectionAgentId;
+              if (reflectionAgentId === "current") {
+                reflectionAgentId = (contextForLog.sessionEntry as any)?.agentId || "";
+              }
+
+              if (reflectionAgentId) {
+                const parentId = event.sessionId || (contextForLog.sessionEntry as any)?.sessionId || contextForLog.sessionId || "unknown";
+                const reflectionSessionKey = `agent:${reflectionAgentId}:reflection:${parentId}`;
+                
+                let finalPrompt = reflectionPrompt;
+                if (parentId && parentId !== "unknown") {
+                  finalPrompt += `\n\n[SYSTEM GUIDANCE]:\n1. You MUST use the 'sessions_history' tool to read the transcript of the session you are auditing. The session ID to audit is: ${parentId}.\n2. Prefer using 'self_improvement_log', 'extract_skill_from_learning', and 'memory_store' tools instead of manually editing markdown files. These tools ensure your learnings are indexed in the LanceDB vector database for semantic recall across future sessions.`;
+                }
+
+                runReflectionViaCli({
+                  agentId: reflectionAgentId,
+                  prompt: finalPrompt,
+                  model: reflectionModel,
+                  workspaceDir: await api.runtime.agent.resolveAgentWorkspaceDir(reflectionAgentId),
+                  timeoutMs: config.memoryReflection?.timeoutMs ?? DEFAULT_REFLECTION_TIMEOUT_MS,
+                  thinkLevel: config.memoryReflection?.thinkLevel ?? DEFAULT_REFLECTION_THINK_LEVEL,
+                  isBackground: true,
+                  parentSessionId: parentId,
+                }).catch((err: any) => {
+                  api.logger.warn(`self-improvement: background reflection CLI run failed: ${String(err)}`);
+                });
+
+                api.logger.info(`self-improvement: command:${action} triggered background reflection session ${reflectionSessionKey}${reflectionModel ? ` (model: ${reflectionModel})` : ""} via CLI`);
+                // IMPORTANT: Stop here to avoid injecting the manual note below
+                return;
+              }
+            }
+
             // Skip self-improvement note on Discord channel (non-thread) resets
             // to avoid contributing to the post-reset startup race on Discord channels.
             // Discord thread resets are handled separately by the OpenClaw core's
             // postRotationStartupUntilMs mechanism (PR #49001).
             // Note: Provider lives in sessionEntry.Provider; MessageThreadId lives in
             // sessionEntry.threadId (populated from ctx.MessageThreadId at session creation).
-            const provider = contextForLog.sessionEntry?.Provider ?? "";
-            const threadId = contextForLog.sessionEntry?.threadId;
+            const provider = (contextForLog.sessionEntry as any)?.Provider ?? "";
+            const threadId = (contextForLog.sessionEntry as any)?.threadId;
             if (provider === "discord" && (threadId == null || threadId === "")) {
               api.logger.info(
                 `self-improvement: command:${action} skipped on Discord channel (non-thread) reset to avoid startup race; use /new in thread or restart gateway if startup is incomplete`
@@ -3054,6 +3113,63 @@ const memoryLanceDBProPlugin = {
           name: "memory-lancedb-pro.self-improvement.command-reset",
           description: "Append self-improvement note before /reset",
         });
+
+        if (config.selfImprovement?.reflectionAgentId) {
+          api.on("session_end", async (endEvent: any, ctx: any) => {
+            const sessionKey = endEvent?.sessionKey || ctx?.sessionKey || "";
+            const sessionId = endEvent?.sessionId || ctx?.sessionId || "";
+            // Prevent infinite loop by skipping sessions spawned by reflection
+            if (sessionId.includes("reflection-cli") || sessionKey.includes("reflection")) {
+              return;
+            }
+
+            let reflectionAgentId = config.selfImprovement.reflectionAgentId;
+            if (reflectionAgentId === "current") {
+              const parsedAgent = sessionKey.split(":")[1];
+              reflectionAgentId = ctx?.agentId || parsedAgent || "";
+            }
+
+            if (reflectionAgentId && reflectionAgentId !== "unknown") {
+              const reflectionPrompt = config.selfImprovement.reflectionPrompt || DEFAULT_SELF_IMPROVEMENT_REFLECTION_PROMPT;
+              const reflectionModel = config.selfImprovement.reflectionModel;
+              const parentId = sessionId || "unknown";
+              const parentAgentId = ctx?.agentId || (sessionKey ? sessionKey.split(":")[1] : "unknown");
+
+              api.logger.info(`self-improvement: session_end triggered background reflection for subagent ${reflectionAgentId} (auditing ${parentAgentId})`);
+              
+              let finalPrompt = reflectionPrompt;
+              if (parentId && parentId !== "unknown") {
+                finalPrompt += `\n\n[SYSTEM GUIDANCE]:\n1. You MUST use the 'sessions_history' tool to read the transcript of the session you are auditing. The session ID to audit is: ${parentId} (Originating Agent: ${parentAgentId}).\n2. Prefer using 'self_improvement_log', 'extract_skill_from_learning', and 'memory_store' tools instead of manually editing markdown files. These tools ensure your learnings are indexed in the LanceDB vector database for semantic recall across future sessions.`;
+              }
+
+              runReflectionViaCli({
+                agentId: reflectionAgentId,
+                prompt: finalPrompt,
+                model: reflectionModel,
+                workspaceDir: await api.runtime.agent.resolveAgentWorkspaceDir(reflectionAgentId),
+                timeoutMs: config.memoryReflection?.timeoutMs ?? DEFAULT_REFLECTION_TIMEOUT_MS,
+                thinkLevel: config.memoryReflection?.thinkLevel ?? DEFAULT_REFLECTION_THINK_LEVEL,
+                isBackground: true,
+                parentSessionId: parentId,
+              }).catch((err: any) => {
+                api.logger.warn(`self-improvement: background reflection CLI run failed: ${String(err)}`);
+              });
+            }
+          });
+
+          api.on("agent_end", async (endEvent: any) => {
+            if (endEvent?.label?.includes("self-mortem analysis")) {
+              const parentId = endEvent.parentSessionId;
+              if (parentId && typeof (api as any).broadcast === "function") {
+                await (api as any).broadcast({
+                  type: "system_note",
+                  content: "Success: Knowledge base updated with findings from the previous session (.learnings, AGENTS, SOUL, TOOLS files refreshed).",
+                  sessionId: parentId
+                }).catch((err: any) => api.logger.warn(`self-improvement: completion broadcast failed: ${err}`));
+              }
+            }
+          });
+        }
       }
 
       (isCliMode() ? api.logger.debug : api.logger.info)(
@@ -3260,6 +3376,13 @@ const memoryLanceDBProPlugin = {
         try {
           pruneReflectionSessionState();
           const action = String(event?.action || "unknown");
+
+          // Bypass if automated background reflection is already handling this
+          if (config.selfImprovement?.enabled && config.selfImprovement.reflectionAgentId) {
+            api.logger.debug(`memory-reflection: command:${action} skipping legacy blocking reflection; background reflection is active`);
+            return;
+          }
+
           const context = (event.context || {}) as Record<string, unknown>;
           const cfg = context.cfg;
           const workspaceDir = resolveWorkspaceDirFromContext(context);
@@ -3920,6 +4043,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated) ?? 8,
+    autoRecallTimeoutMs: parsePositiveInt(cfg.autoRecallTimeoutMs),
     autoRecallMaxItems: parsePositiveInt(cfg.autoRecallMaxItems) ?? 3,
     autoRecallMaxChars: parsePositiveInt(cfg.autoRecallMaxChars) ?? 600,
     autoRecallPerItemMaxChars: parsePositiveInt(cfg.autoRecallPerItemMaxChars) ?? 180,
@@ -3960,13 +4084,18 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     sessionStrategy,
     selfImprovement: typeof cfg.selfImprovement === "object" && cfg.selfImprovement !== null
       ? {
-        enabled: (cfg.selfImprovement as Record<string, unknown>).enabled !== false,
+        enabled: (cfg.selfImprovement as Record<string, unknown>).enabled === true,
         beforeResetNote: (cfg.selfImprovement as Record<string, unknown>).beforeResetNote !== false,
         skipSubagentBootstrap: (cfg.selfImprovement as Record<string, unknown>).skipSubagentBootstrap !== false,
         ensureLearningFiles: (cfg.selfImprovement as Record<string, unknown>).ensureLearningFiles !== false,
+        reflectionAgentId: asNonEmptyString((cfg.selfImprovement as Record<string, unknown>).reflectionAgentId),
+        reflectionModel: asNonEmptyString((cfg.selfImprovement as Record<string, unknown>).reflectionModel),
+        reflectionPrompt: typeof (cfg.selfImprovement as Record<string, unknown>).reflectionPrompt === "string" 
+          ? (cfg.selfImprovement as Record<string, unknown>).reflectionPrompt as string 
+          : undefined,
       }
       : {
-        enabled: true,
+        enabled: false,
         beforeResetNote: true,
         skipSubagentBootstrap: true,
         ensureLearningFiles: true,

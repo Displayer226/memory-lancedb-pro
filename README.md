@@ -391,6 +391,15 @@ Query → BM25 FTS ─────┘
 
 > **Note (v1.1.0-beta.9+):** Auto-recall now uses the `before_prompt_build` hook instead of the deprecated `before_agent_start`. See [Hook Adaptation](#hook-adaptation-openclaw-20263) below for details.
 
+### Asynchronous Background Self-Mortem & Reflection
+
+- **Non-Blocking Architecture**: Automatically triggers a completely detached CLI background process on UI `/new`, `/reset`, or subagent `session_end` events.
+- **Subagent Autonomy**: By setting `selfImprovement.reflectionAgentId: "current"`, *every* subagent audits its own completed session and independently updates its `.learnings/` workspace.
+- **RAG-Powered Auditing**: The reflection agent intelligently chunks large session transcripts via the `sessions_history` tool to bypass context window limits.
+- **Vector Integration**: Leverages native LanceDB tools (`self_improvement_log`, `extract_skill_from_learning`) to insert distilled facts directly into the semantic vector store, avoiding brittle Markdown manipulations.
+
+> **⚠️ Required Tools**: For this architecture to function, the target `reflectionAgentId` **MUST** be granted the `sessions_history` tool (otherwise it starts with a blind context). It is also **strongly recommended** to enable `self_improvement_log`, `memory_store`, and `extract_skill_from_learning` so the agent can safely push to LanceDB. *(Note: `extract_skill_from_learning` requires `"enableManagementTools": true` in your plugin configuration).*
+
 ### Noise Filtering & Adaptive Retrieval
 
 - Filters low-quality content: agent refusals, meta-questions, greetings
@@ -479,6 +488,10 @@ Query → BM25 FTS ─────┘
   "sessionMemory": {
     "enabled": false,
     "messageCount": 15
+  },
+  "selfImprovement": {
+    "reflectionAgentId": "current",
+    "reflectionModel": "gpt-4o-mini"
   },
   "smartExtraction": true,
   "llm": {

@@ -116,6 +116,13 @@
         "default": 8,
         "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication."
       },
+      "autoRecallTimeoutMs": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 60000,
+        "default": 5000,
+        "description": "Timeout for the entire auto-recall pipeline (embedding + search + rerank) in milliseconds."
+      },
       "autoRecallMaxItems": {
         "type": "integer",
         "minimum": 1,
@@ -557,11 +564,25 @@
         "properties": {
           "enabled": {
             "type": "boolean",
-            "default": true
+            "default": false
           },
           "beforeResetNote": {
             "type": "boolean",
             "default": true
+          },
+          "reflectionAgentId": {
+            "type": "string",
+            "default": "",
+            "description": "If set, automatically spawn this agent to perform a background self-mortem analysis and update .learnings/ files instead of showing a manual note. Set to 'current' to use the same agent that triggered the /new or /reset."
+          },
+          "reflectionModel": {
+            "type": "string",
+            "description": "Optional model override for the background reflection agent. If unset, uses the agent's default model."
+          },
+          "reflectionPrompt": {
+            "type": "string",
+            "default": "Analyze the provided session history. Identify learnings, errors, and best practices. Update .learnings/LEARNINGS.md and .learnings/ERRORS.md. Distill reusable rules into AGENTS.md, SOUL.md, or TOOLS.md. Work silently in the background.",
+            "description": "Prompt to send to the background reflection agent."
           },
           "skipSubagentBootstrap": {
             "type": "boolean",
@@ -1010,6 +1031,11 @@
       "help": "Minimum number of conversation turns before a specific memory can be re-injected in the same session.",
       "advanced": true
     },
+    "autoRecallTimeoutMs": {
+      "label": "Auto-Recall Timeout (ms)",
+      "help": "Timeout for the entire auto-recall pipeline (embedding + search + rerank) in milliseconds. Default: 5000.",
+      "advanced": true
+    },
     "autoRecallMaxItems": {
       "label": "Auto-Recall Max Items",
       "help": "Maximum memories that auto-recall can inject in one turn.",
@@ -1197,6 +1223,16 @@
     "selfImprovement.ensureLearningFiles": {
       "label": "Ensure Learning Files",
       "help": "Auto-create .learnings files when missing",
+      "advanced": true
+    },
+    "selfImprovement.reflectionAgentId": {
+      "label": "Reflection Agent ID",
+      "help": "ID of the agent to spawn for background reflection. Use 'current' to use the same agent that was reset.",
+      "advanced": true
+    },
+    "selfImprovement.reflectionModel": {
+      "label": "Reflection Model Override",
+      "help": "Optional model override for the background reflection agent.",
       "advanced": true
     },
     "memoryReflection.storeToLanceDB": {
